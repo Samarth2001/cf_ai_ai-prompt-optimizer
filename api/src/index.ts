@@ -496,72 +496,170 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-app.use("/api/enhance", authMiddleware);
-
-app.use("/api/enhance", async (c, next) => {
-  const userToken = c.get("jwtPayload").sub;
-  if (!userToken) {
-    const errOrigin = c.get("corsOrigin") as string;
-    logAuthFailed(c, "missing_sub");
-    return jsonError(c, 401, "UNAUTHORIZED", "Invalid token", errOrigin);
-  }
-
-  const RATE_LIMIT_PER_DAY = parseInt(c.env.RATE_LIMIT_PER_DAY || "100", 10);
-  const ip = c.req.header("CF-Connecting-IP") || "unknown";
-
-  try {
-    const id = c.env.RATE_LIMITER.idFromName(`${userToken}:${ip}`);
-    const stub = c.env.RATE_LIMITER.get(id);
-    const bypass = (c.env.RATE_LIMIT_BYPASS_SUBS || "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const res = bypass.includes(userToken)
-      ? await stub.fetch(c.req.url + "?peek=1", { method: "GET" })
-      : await stub.fetch(c.req.url, { method: "POST" });
-    const rateLimitResult = await res.json<{
-      limit: number;
-      remaining: number;
-      reset: number;
-      success: boolean;
-    }>();
-
-    c.set("usageCount", RATE_LIMIT_PER_DAY - rateLimitResult.remaining);
-    c.set("rateLimit", {
-      limit: rateLimitResult.limit,
-      remaining: rateLimitResult.remaining,
-      reset: rateLimitResult.reset,
-    });
-
-    if (!rateLimitResult.success) {
-      const errOrigin = (c.get("corsOrigin") as string) || "*";
-      const headers = buildBaseHeaders(errOrigin, {
-        "X-Usage-Count": String(RATE_LIMIT_PER_DAY - rateLimitResult.remaining),
-        "X-RateLimit-Limit": String(rateLimitResult.limit),
-        "X-RateLimit-Remaining": String(rateLimitResult.remaining),
-        "X-RateLimit-Reset": String(rateLimitResult.reset),
-      });
-      logRateLimitExceeded(c, userToken, rateLimitResult.limit, rateLimitResult.reset);
-      return c.json(
-        { code: "RATE_LIMIT_EXCEEDED", message: "Rate limit exceeded" },
-        429,
-        headers
-      );
+function createRateLimitMiddleware() {
+  return async (c: any, next: any) => {
+    const userToken = (c.get("jwtPayload") as any)?.sub;
+    if (!userToken) {
+      const errOrigin = c.get("corsOrigin") as string;
+      logAuthFailed(c, "missing_sub");
+      return jsonError(c, 401, "UNAUTHORIZED", "Invalid token", errOrigin);
     }
-  } catch (e) {
-    console.error("Durable Object error:", e);
-    const errOrigin = (c.get("corsOrigin") as string) || "*";
-    return jsonError(
-      c,
-      500,
-      "INTERNAL_ERROR",
-      "Rate limiter failed",
-      errOrigin
+
+    const RATE_LIMIT_PER_DAY = parseInt(c.env.RATE_LIMIT_PER_DAY || "100", 10);
+    const ip = c.req.header("CF-Connecting-IP") || "unknown";
+
+    try {
+      const id = c.env.RATE_LIMITER.idFromName(`${userToken}:${ip}`);
+      const stub = c.env.RATE_LIMITER.get(id);
+      const bypass = (c.env.RATE_LIMIT_BYPASS_SUBS || "")
+        .split(",")
+        .map((s: string) => s.trim())
+        .filter(Boolean);
+      const res = bypass.includes(userToken)
+        ? await stub.fetch(c.req.url + "?peek=1", { method: "GET" })
+        : await stub.fetch(c.req.url, { method: "POST" });
+      const rateLimitResult = await res.json<{
+        limit: number;
+        remaining: number;
+        reset: number;
+        success: boolean;
+      }>();
+
+      c.set("usageCount", RATE_LIMIT_PER_DAY - rateLimitResult.remaining);
+      c.set("rateLimit", {
+        limit: rateLimitResult.limit,
+        remaining: rateLimitResult.remaining,
+        reset: rateLimitResult.reset,
+      });
+
+      if (!rateLimitResult.success) {
+        const errOrigin = (c.get("corsOrigin") as string) || "*";
+        const headers = buildBaseHeaders(errOrigin, {
+          "X-Usage-Count": String(RATE_LIMIT_PER_DAY - rateLimitResult.remaining),
+          "X-RateLimit-Limit": String(rateLimitResult.limit),
+          "X-RateLimit-Remaining": String(rateLimitResult.remaining),
+          "X-RateLimit-Reset": String(rateLimitResult.reset),
+        });
+        logRateLimitExceeded(c, userToken, rateLimitResult.limit, rateLimitResult.reset);
+        return c.json(
+          { code: "RATE_LIMIT_EXCEEDED", message: "Rate limit exceeded" },
+          429,
+          headers
+        );
+      }
+    } catch (e) {
+      console.error("Durable Object error:", e);
+      const errOrigin = (c.get("corsOrigin") as string) || "*";
+      return jsonError(c, 500, "INTERNAL_ERROR", "Rate limiter failed", errOrigin);
+    }
+
+    await next();
+  };
+}
+
+async function callOpenRouterAndBuildResponse(
+  c: any,
+  apiKey: string,
+  origin: string,
+  messages: Array<{ role: string; content: string }>,
+  model: string,
+  maxTokens: number,
+  temperature: number
+): Promise<Response> {
+  const REQUEST_TIMEOUT_MS = parseInt(c.env.REQUEST_TIMEOUT_MS || "15000", 10);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  let response: Response;
+  try {
+    const systemPrompt = await resolveSystemPrompt(c.env);
+    const payload = {
+      model,
+      max_tokens: maxTokens,
+      temperature,
+      messages: injectSystemPrompt(systemPrompt, messages),
+    };
+    response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        "HTTP-Referer": c.env.APP_HTTP_REFERER,
+        "X-Title": c.env.APP_TITLE || "Enhance Prompt",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err?.name === "AbortError") {
+      return jsonError(c, 504, "UPSTREAM_TIMEOUT", "Upstream request timed out", origin);
+    }
+    return jsonError(c, 502, "UPSTREAM_UNAVAILABLE", "Upstream request failed", origin);
+  }
+  clearTimeout(timeoutId);
+
+  const usageCount = c.get("usageCount") as number;
+  const rate = c.get("rateLimit") as { limit: number; remaining: number; reset: number };
+
+  if (!response.ok) {
+    let upstreamPayload: unknown = null;
+    const ct = response.headers.get("content-type") || "";
+    try {
+      if (ct.includes("application/json")) {
+        upstreamPayload = await response.json();
+      } else {
+        const txt = await response.text();
+        upstreamPayload = txt.slice(0, 2000);
+      }
+    } catch {}
+    const headers = buildBaseHeaders(origin, {
+      "Content-Type": "application/json",
+      "X-Usage-Count": String(usageCount),
+      "X-RateLimit-Limit": String(rate.limit),
+      "X-RateLimit-Remaining": String(rate.remaining),
+      "X-RateLimit-Reset": String(rate.reset),
+    });
+    if (response.status >= 500) {
+      logServerError(c, "UPSTREAM_ERROR");
+    }
+    return new Response(
+      JSON.stringify({
+        code: "UPSTREAM_ERROR",
+        message: "Upstream error",
+        status: response.status,
+        upstream: upstreamPayload,
+      }),
+      { status: response.status, headers: new Headers(headers) }
     );
   }
 
-  await next();
-});
+  const headers = new Headers(response.headers);
+  headers.set("X-Usage-Count", String(usageCount));
+  headers.set("X-RateLimit-Limit", String(rate.limit));
+  headers.set("X-RateLimit-Remaining", String(rate.remaining));
+  headers.set("X-RateLimit-Reset", String(rate.reset));
+  for (const [key, value] of Object.entries(buildBaseHeaders(origin))) {
+    headers.set(key, value);
+  }
+
+  try {
+    const userId = (c.get("jwtPayload") as any)?.sub;
+    if (userId) {
+      const aggId = c.env.USAGE_AGGREGATOR.idFromName(String(userId));
+      const agg = c.env.USAGE_AGGREGATOR.get(aggId);
+      await agg.fetch("https://usage/incr", {
+        method: "POST",
+        body: JSON.stringify({ amount: 1 }),
+      });
+    }
+  } catch {}
+
+  return new Response(response.body, { status: response.status, headers });
+}
+
+app.use("/api/enhance", authMiddleware);
+app.use("/api/enhance", createRateLimitMiddleware());
 
 app.use("/api/ratelimit", authMiddleware);
 
@@ -841,56 +939,24 @@ app.post("/api/enhance", async (c) => {
   try {
     const contentLengthHeader = c.req.header("Content-Length");
     if (contentLengthHeader && Number(contentLengthHeader) > MAX_BODY_BYTES) {
-      return jsonError(
-        c,
-        413,
-        "PAYLOAD_TOO_LARGE",
-        "Request body too large",
-        origin
-      );
+      return jsonError(c, 413, "PAYLOAD_TOO_LARGE", "Request body too large", origin);
     }
 
     const MAX_PROMPT_CHARS = parseInt(c.env.MAX_PROMPT_CHARS || "4000", 10);
-    const DEFAULT_MODEL =
-      c.env.DEFAULT_MODEL || "deepseek/deepseek-chat-v3.1:free";
+    const DEFAULT_MODEL = c.env.DEFAULT_MODEL || "deepseek/deepseek-chat-v3.1:free";
     const DEFAULT_MAX_TOKENS = parseInt(c.env.DEFAULT_MAX_TOKENS || "500", 10);
     const DEFAULT_TEMPERATURE = parseFloat(c.env.DEFAULT_TEMPERATURE || "0.7");
 
     const apiRequestSchema = z.object({
       model: z.string().optional().default(DEFAULT_MODEL),
-      messages: z
-        .array(
-          z.object({
-            role: z.string(),
-            content: z.string().min(1).max(MAX_PROMPT_CHARS),
-          })
-        )
-        .min(1),
-      max_tokens: z
-        .number()
-        .int()
-        .positive()
-        .max(4096)
-        .optional()
-        .default(DEFAULT_MAX_TOKENS),
-      temperature: z
-        .number()
-        .min(0)
-        .max(2)
-        .optional()
-        .default(DEFAULT_TEMPERATURE),
+      messages: z.array(z.object({ role: z.string(), content: z.string().min(1).max(MAX_PROMPT_CHARS) })).min(1),
+      max_tokens: z.number().int().positive().max(4096).optional().default(DEFAULT_MAX_TOKENS),
+      temperature: z.number().min(0).max(2).optional().default(DEFAULT_TEMPERATURE),
     });
 
     const rawText = await c.req.text();
-    const rawBytes = new TextEncoder().encode(rawText).length;
-    if (rawBytes > MAX_BODY_BYTES) {
-      return jsonError(
-        c,
-        413,
-        "PAYLOAD_TOO_LARGE",
-        "Request body too large",
-        origin
-      );
+    if (new TextEncoder().encode(rawText).length > MAX_BODY_BYTES) {
+      return jsonError(c, 413, "PAYLOAD_TOO_LARGE", "Request body too large", origin);
     }
 
     let body: unknown;
@@ -902,297 +968,59 @@ app.post("/api/enhance", async (c) => {
 
     const validation = apiRequestSchema.safeParse(body);
     if (!validation.success) {
-      return c.json(
-        {
-          code: "INVALID_BODY",
-          message: "Invalid request body",
-          details: validation.error.flatten(),
-        },
-        400,
-        buildBaseHeaders(origin)
-      );
+      return c.json({ code: "INVALID_BODY", message: "Invalid request body", details: validation.error.flatten() }, 400, buildBaseHeaders(origin));
     }
 
-    const totalPromptChars = validation.data.messages.reduce(
-      (sum, m) => sum + m.content.length,
-      0
-    );
+    const totalPromptChars = validation.data.messages.reduce((sum, m) => sum + m.content.length, 0);
     if (totalPromptChars > MAX_PROMPT_CHARS) {
-      return jsonError(
-        c,
-        413,
-        "PROMPT_TOO_LARGE",
-        "Prompt length exceeds limit",
-        origin
-      );
+      return jsonError(c, 413, "PROMPT_TOO_LARGE", "Prompt length exceeds limit", origin);
     }
 
     const openRouterKey = (c.env.OPENROUTER_API_KEY || "").trim();
     if (!openRouterKey) {
-      return jsonError(
-        c,
-        500,
-        "SERVER_MISCONFIGURED",
-        "Missing OPENROUTER_API_KEY in worker environment",
-        origin
-      );
+      return jsonError(c, 500, "SERVER_MISCONFIGURED", "Missing OPENROUTER_API_KEY in worker environment", origin);
     }
 
-    const REQUEST_TIMEOUT_MS = parseInt(
-      c.env.REQUEST_TIMEOUT_MS || "15000",
-      10
+    return await callOpenRouterAndBuildResponse(
+      c, openRouterKey, origin,
+      validation.data.messages, validation.data.model,
+      validation.data.max_tokens, validation.data.temperature
     );
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-    let response: Response;
-    try {
-      const systemPrompt = await resolveSystemPrompt(c.env);
-      const payload = {
-        ...validation.data,
-        model: DEFAULT_MODEL,
-        messages: injectSystemPrompt(systemPrompt, validation.data.messages),
-      };
-      response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${openRouterKey}`,
-          "HTTP-Referer": c.env.APP_HTTP_REFERER,
-          "X-Title": c.env.APP_TITLE || "Enhance Prompt",
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-    } catch (err: any) {
-      if (err?.name === "AbortError") {
-        clearTimeout(timeoutId);
-        return jsonError(
-          c,
-          504,
-          "UPSTREAM_TIMEOUT",
-          "Upstream request timed out",
-          origin
-        );
-      }
-      clearTimeout(timeoutId);
-      return jsonError(
-        c,
-        502,
-        "UPSTREAM_UNAVAILABLE",
-        "Upstream request failed",
-        origin
-      );
-    }
-    clearTimeout(timeoutId);
-
-    const usageCount = c.get("usageCount") as number;
-    const rate = c.get("rateLimit") as {
-      limit: number;
-      remaining: number;
-      reset: number;
-    };
-
-    if (!response.ok) {
-      let upstreamPayload: unknown = null;
-      const ct = response.headers.get("content-type") || "";
-      try {
-        if (ct.includes("application/json")) {
-          upstreamPayload = await response.json();
-        } else {
-          const txt = await response.text();
-          upstreamPayload = txt.slice(0, 2000);
-        }
-      } catch {}
-      const headers = buildBaseHeaders(origin, {
-        "Content-Type": "application/json",
-        "X-Usage-Count": String(usageCount),
-        "X-RateLimit-Limit": String(rate.limit),
-        "X-RateLimit-Remaining": String(rate.remaining),
-        "X-RateLimit-Reset": String(rate.reset),
-      });
-      if (response.status >= 500) {
-        logServerError(c, "UPSTREAM_ERROR");
-      }
-      if (response.status >= 500) {
-        logServerError(c, "UPSTREAM_ERROR");
-      }
-      return new Response(
-        JSON.stringify({
-          code: "UPSTREAM_ERROR",
-          message: "Upstream error",
-          status: response.status,
-          upstream: upstreamPayload,
-        }),
-        { status: response.status, headers: new Headers(headers) }
-      );
-    }
-
-    const headers = new Headers(response.headers);
-    headers.set("X-Usage-Count", String(usageCount));
-    headers.set("X-RateLimit-Limit", String(rate.limit));
-    headers.set("X-RateLimit-Remaining", String(rate.remaining));
-    headers.set("X-RateLimit-Reset", String(rate.reset));
-    for (const [key, value] of Object.entries(buildBaseHeaders(origin))) {
-      headers.set(key, value);
-    }
-
-    // Increment per-user usage counters for cost tracking
-    try {
-      const userId = (c.get("jwtPayload") as any)?.sub;
-      if (userId) {
-        const aggId = c.env.USAGE_AGGREGATOR.idFromName(String(userId));
-        const agg = c.env.USAGE_AGGREGATOR.get(aggId);
-        await agg.fetch("https://usage/incr", {
-          method: "POST",
-          body: JSON.stringify({ amount: 1 }),
-        });
-      }
-    } catch {}
-
-    return new Response(response.body, {
-      status: response.status,
-      headers,
-    });
   } catch (e: any) {
     logServerError(c, "INTERNAL_ERROR");
-    return c.json(
-      {
-        code: "INTERNAL_ERROR",
-        message: "Internal Server Error",
-        details: e?.message || String(e),
-      },
-      500,
-      buildBaseHeaders(origin)
-    );
+    return c.json({ code: "INTERNAL_ERROR", message: "Internal Server Error", details: e?.message || String(e) }, 500, buildBaseHeaders(origin));
   }
 });
 
 // BYOK variant: user provides an OpenRouter API key per request via header.
 // System prompt is injected server-side to avoid exposing it in client code.
 app.use("/api/enhance/byok", authMiddleware);
-
-app.use("/api/enhance/byok", async (c, next) => {
-  const userToken = (c.get("jwtPayload") as any)?.sub;
-  if (!userToken) {
-    const errOrigin = c.get("corsOrigin") as string;
-    logAuthFailed(c, "missing_sub");
-    return jsonError(c, 401, "UNAUTHORIZED", "Invalid token", errOrigin);
-  }
-
-  const RATE_LIMIT_PER_DAY = parseInt(c.env.RATE_LIMIT_PER_DAY || "100", 10);
-  const ip = c.req.header("CF-Connecting-IP") || "unknown";
-
-  try {
-    const id = c.env.RATE_LIMITER.idFromName(`${userToken}:${ip}`);
-    const stub = c.env.RATE_LIMITER.get(id);
-    const bypass = (c.env.RATE_LIMIT_BYPASS_SUBS || "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const res = bypass.includes(userToken)
-      ? await stub.fetch(c.req.url + "?peek=1", { method: "GET" })
-      : await stub.fetch(c.req.url, { method: "POST" });
-    const rateLimitResult = await res.json<{
-      limit: number;
-      remaining: number;
-      reset: number;
-      success: boolean;
-    }>();
-
-    c.set("usageCount", RATE_LIMIT_PER_DAY - rateLimitResult.remaining);
-    c.set("rateLimit", {
-      limit: rateLimitResult.limit,
-      remaining: rateLimitResult.remaining,
-      reset: rateLimitResult.reset,
-    });
-
-    if (!rateLimitResult.success) {
-      const errOrigin = (c.get("corsOrigin") as string) || "*";
-      const headers = buildBaseHeaders(errOrigin, {
-        "X-Usage-Count": String(RATE_LIMIT_PER_DAY - rateLimitResult.remaining),
-        "X-RateLimit-Limit": String(rateLimitResult.limit),
-        "X-RateLimit-Remaining": String(rateLimitResult.remaining),
-        "X-RateLimit-Reset": String(rateLimitResult.reset),
-      });
-      logRateLimitExceeded(c, userToken, rateLimitResult.limit, rateLimitResult.reset);
-      return c.json(
-        { code: "RATE_LIMIT_EXCEEDED", message: "Rate limit exceeded" },
-        429,
-        headers
-      );
-    }
-  } catch (e) {
-    console.error("Durable Object error:", e);
-    const errOrigin = (c.get("corsOrigin") as string) || "*";
-    return jsonError(
-      c,
-      500,
-      "INTERNAL_ERROR",
-      "Rate limiter failed",
-      errOrigin
-    );
-  }
-
-  await next();
-});
+app.use("/api/enhance/byok", createRateLimitMiddleware());
 
 app.post("/api/enhance/byok", async (c) => {
   const origin = c.get("corsOrigin");
   try {
     const contentLengthHeader = c.req.header("Content-Length");
     if (contentLengthHeader && Number(contentLengthHeader) > MAX_BODY_BYTES) {
-      return jsonError(
-        c,
-        413,
-        "PAYLOAD_TOO_LARGE",
-        "Request body too large",
-        origin
-      );
+      return jsonError(c, 413, "PAYLOAD_TOO_LARGE", "Request body too large", origin);
     }
 
     const MAX_PROMPT_CHARS = parseInt(c.env.MAX_PROMPT_CHARS || "4000", 10);
-    const DEFAULT_MODEL =
-      c.env.DEFAULT_MODEL || "deepseek/deepseek-chat-v3.1:free";
+    const DEFAULT_MODEL = c.env.DEFAULT_MODEL || "deepseek/deepseek-chat-v3.1:free";
     const DEFAULT_MAX_TOKENS = parseInt(c.env.DEFAULT_MAX_TOKENS || "500", 10);
     const DEFAULT_TEMPERATURE = parseFloat(c.env.DEFAULT_TEMPERATURE || "0.7");
 
     const apiRequestSchema = z.object({
       byokKey: z.string().min(1, "byokKey required"),
       model: z.string().optional().default(DEFAULT_MODEL),
-      messages: z
-        .array(
-          z.object({
-            role: z.string(),
-            content: z.string().min(1).max(MAX_PROMPT_CHARS),
-          })
-        )
-        .min(1),
-      max_tokens: z
-        .number()
-        .int()
-        .positive()
-        .max(4096)
-        .optional()
-        .default(DEFAULT_MAX_TOKENS),
-      temperature: z
-        .number()
-        .min(0)
-        .max(2)
-        .optional()
-        .default(DEFAULT_TEMPERATURE),
+      messages: z.array(z.object({ role: z.string(), content: z.string().min(1).max(MAX_PROMPT_CHARS) })).min(1),
+      max_tokens: z.number().int().positive().max(4096).optional().default(DEFAULT_MAX_TOKENS),
+      temperature: z.number().min(0).max(2).optional().default(DEFAULT_TEMPERATURE),
     });
 
     const rawText = await c.req.text();
-    const rawBytes = new TextEncoder().encode(rawText).length;
-    if (rawBytes > MAX_BODY_BYTES) {
-      return jsonError(
-        c,
-        413,
-        "PAYLOAD_TOO_LARGE",
-        "Request body too large",
-        origin
-      );
+    if (new TextEncoder().encode(rawText).length > MAX_BODY_BYTES) {
+      return jsonError(c, 413, "PAYLOAD_TOO_LARGE", "Request body too large", origin);
     }
 
     let body: unknown;
@@ -1204,155 +1032,24 @@ app.post("/api/enhance/byok", async (c) => {
 
     const validation = apiRequestSchema.safeParse(body);
     if (!validation.success) {
-      return c.json(
-        {
-          code: "INVALID_BODY",
-          message: "Invalid request body",
-          details: validation.error.flatten(),
-        },
-        400,
-        buildBaseHeaders(origin)
-      );
+      return c.json({ code: "INVALID_BODY", message: "Invalid request body", details: validation.error.flatten() }, 400, buildBaseHeaders(origin));
     }
 
-    const totalPromptChars = validation.data.messages.reduce(
-      (sum, m) => sum + m.content.length,
-      0
-    );
+    const totalPromptChars = validation.data.messages.reduce((sum, m) => sum + m.content.length, 0);
     if (totalPromptChars > MAX_PROMPT_CHARS) {
-      return jsonError(
-        c,
-        413,
-        "PROMPT_TOO_LARGE",
-        "Prompt length exceeds limit",
-        origin
-      );
+      return jsonError(c, 413, "PROMPT_TOO_LARGE", "Prompt length exceeds limit", origin);
     }
 
     const byokKey = validation.data.byokKey.trim();
 
-    const REQUEST_TIMEOUT_MS = parseInt(
-      c.env.REQUEST_TIMEOUT_MS || "15000",
-      10
+    return await callOpenRouterAndBuildResponse(
+      c, byokKey, origin,
+      validation.data.messages, validation.data.model,
+      validation.data.max_tokens, validation.data.temperature
     );
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-    let response: Response;
-    try {
-      const systemPrompt = await resolveSystemPrompt(c.env);
-      const { byokKey: _omit, ...rest } = validation.data as any;
-      const payload = {
-        ...rest,
-        model: DEFAULT_MODEL,
-        messages: injectSystemPrompt(systemPrompt, rest.messages),
-      } as any;
-      response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${byokKey}`,
-          "HTTP-Referer": c.env.APP_HTTP_REFERER,
-          "X-Title": c.env.APP_TITLE || "Enhance Prompt",
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-    } catch (err: any) {
-      if (err?.name === "AbortError") {
-        clearTimeout(timeoutId);
-        return jsonError(
-          c,
-          504,
-          "UPSTREAM_TIMEOUT",
-          "Upstream request timed out",
-          origin
-        );
-      }
-      clearTimeout(timeoutId);
-      return jsonError(
-        c,
-        502,
-        "UPSTREAM_UNAVAILABLE",
-        "Upstream request failed",
-        origin
-      );
-    }
-    clearTimeout(timeoutId);
-
-    const usageCount = c.get("usageCount") as number;
-    const rate = c.get("rateLimit") as {
-      limit: number;
-      remaining: number;
-      reset: number;
-    };
-
-    if (!response.ok) {
-      let upstreamPayload: unknown = null;
-      const ct = response.headers.get("content-type") || "";
-      try {
-        if (ct.includes("application/json")) {
-          upstreamPayload = await response.json();
-        } else {
-          const txt = await response.text();
-          upstreamPayload = txt.slice(0, 2000);
-        }
-      } catch {}
-      const headers = buildBaseHeaders(origin, {
-        "Content-Type": "application/json",
-        "X-Usage-Count": String(usageCount),
-        "X-RateLimit-Limit": String(rate.limit),
-        "X-RateLimit-Remaining": String(rate.remaining),
-        "X-RateLimit-Reset": String(rate.reset),
-      });
-      return new Response(
-        JSON.stringify({
-          code: "UPSTREAM_ERROR",
-          message: "Upstream error",
-          status: response.status,
-          upstream: upstreamPayload,
-        }),
-        { status: response.status, headers: new Headers(headers) }
-      );
-    }
-
-    const headers = new Headers(response.headers);
-    headers.set("X-Usage-Count", String(usageCount));
-    headers.set("X-RateLimit-Limit", String(rate.limit));
-    headers.set("X-RateLimit-Remaining", String(rate.remaining));
-    headers.set("X-RateLimit-Reset", String(rate.reset));
-    for (const [key, value] of Object.entries(buildBaseHeaders(origin))) {
-      headers.set(key, value);
-    }
-
-    // Increment per-user usage counters for cost tracking
-    try {
-      const userId = (c.get("jwtPayload") as any)?.sub;
-      if (userId) {
-        const aggId = c.env.USAGE_AGGREGATOR.idFromName(String(userId));
-        const agg = c.env.USAGE_AGGREGATOR.get(aggId);
-        await agg.fetch("https://usage/incr", {
-          method: "POST",
-          body: JSON.stringify({ amount: 1 }),
-        });
-      }
-    } catch {}
-
-    return new Response(response.body, {
-      status: response.status,
-      headers,
-    });
   } catch (e: any) {
     logServerError(c, "INTERNAL_ERROR");
-    return c.json(
-      {
-        code: "INTERNAL_ERROR",
-        message: "Internal Server Error",
-        details: e?.message || String(e),
-      },
-      500,
-      buildBaseHeaders(origin)
-    );
+    return c.json({ code: "INTERNAL_ERROR", message: "Internal Server Error", details: e?.message || String(e) }, 500, buildBaseHeaders(origin));
   }
 });
 

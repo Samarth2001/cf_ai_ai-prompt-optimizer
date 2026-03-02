@@ -367,6 +367,47 @@ async function updateRemoteConfig() {
   }
 }
 
+async function updateRateLimitFromResponse(response) {
+  const limit = response.headers.get("X-RateLimit-Limit");
+  const remaining = response.headers.get("X-RateLimit-Remaining");
+  const reset = response.headers.get("X-RateLimit-Reset");
+  const usageCount = response.headers.get("X-Usage-Count");
+
+  if (limit !== null || remaining !== null || reset !== null || usageCount !== null) {
+    const rateLimitKey = `rate_limit_status`;
+    const currentUsage = (await secureStorageService.retrieve(rateLimitKey)) || {
+      limit: 100,
+      remaining: 100,
+      reset: 0,
+      count: 0,
+    };
+
+    const parsedLimit = parseInt(limit, 10);
+    const parsedRemaining = parseInt(remaining, 10);
+    const parsedReset = parseInt(reset, 10);
+    const parsedCount = parseInt(usageCount, 10);
+
+    const effectiveLimit = !isNaN(parsedLimit) ? parsedLimit : currentUsage.limit;
+    const effectiveCount = !isNaN(parsedCount) ? parsedCount : currentUsage.count;
+    const derivedRemaining = !isNaN(parsedRemaining)
+      ? parsedRemaining
+      : Math.max(0, effectiveLimit - effectiveCount);
+
+    const newUsage = {
+      limit: effectiveLimit,
+      remaining: derivedRemaining,
+      reset: !isNaN(parsedReset) ? parsedReset : currentUsage.reset,
+      count: effectiveCount,
+    };
+
+    await secureStorageService.save(rateLimitKey, newUsage);
+
+    try {
+      await chrome.runtime.sendMessage({ action: "rateLimitUpdate", usage: newUsage });
+    } catch (_) {}
+  }
+}
+
 async function handleProxyRequest({ prompt }, sendResponse) {
   try {
     const jwt = await getOrCreateJwt();
@@ -399,55 +440,7 @@ async function handleProxyRequest({ prompt }, sendResponse) {
       300
     );
 
-    const limit = response.headers.get("X-RateLimit-Limit");
-    const remaining = response.headers.get("X-RateLimit-Remaining");
-    const reset = response.headers.get("X-RateLimit-Reset");
-    const usageCount = response.headers.get("X-Usage-Count");
-
-     if (
-      limit !== null ||
-      remaining !== null ||
-      reset !== null ||
-      usageCount !== null
-    ) {
-      const rateLimitKey = `rate_limit_status`;
-
-      const currentUsage = (await secureStorageService.retrieve(
-        rateLimitKey
-      )) || { limit: 100, remaining: 100, reset: 0, count: 0 };
-
-      const parsedLimit = parseInt(limit, 10);
-      const parsedRemaining = parseInt(remaining, 10);
-      const parsedReset = parseInt(reset, 10);
-      const parsedCount = parseInt(usageCount, 10);
-
-      const effectiveLimit = !isNaN(parsedLimit)
-        ? parsedLimit
-        : currentUsage.limit;
-      const effectiveCount = !isNaN(parsedCount)
-        ? parsedCount
-        : currentUsage.count;
-      const derivedRemaining = !isNaN(parsedRemaining)
-        ? parsedRemaining
-        : Math.max(0, effectiveLimit - effectiveCount);
-
-      const newUsage = {
-        limit: effectiveLimit,
-        remaining: derivedRemaining,
-        reset: !isNaN(parsedReset) ? parsedReset : currentUsage.reset,
-        count: effectiveCount,
-      };
-
-      await secureStorageService.save(rateLimitKey, newUsage);
-
-      try {
-        // Use the same robust object for the UI update message
-        await chrome.runtime.sendMessage({
-          action: "rateLimitUpdate",
-          usage: newUsage,
-        });
-      } catch (_) {}
-    }
+    await updateRateLimitFromResponse(response);
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
@@ -521,54 +514,7 @@ async function handleByokRequest({ prompt }, sendResponse) {
       500
     );
 
-    const limit = response.headers.get("X-RateLimit-Limit");
-    const remaining = response.headers.get("X-RateLimit-Remaining");
-    const reset = response.headers.get("X-RateLimit-Reset");
-    const usageCount = response.headers.get("X-Usage-Count");
-
-    if (
-      limit !== null ||
-      remaining !== null ||
-      reset !== null ||
-      usageCount !== null
-    ) {
-      const rateLimitKey = `rate_limit_status`;
-
-      const currentUsage = (await secureStorageService.retrieve(
-        rateLimitKey
-      )) || { limit: 100, remaining: 100, reset: 0, count: 0 };
-
-      const parsedLimit = parseInt(limit, 10);
-      const parsedRemaining = parseInt(remaining, 10);
-      const parsedReset = parseInt(reset, 10);
-      const parsedCount = parseInt(usageCount, 10);
-
-      const effectiveLimit = !isNaN(parsedLimit)
-        ? parsedLimit
-        : currentUsage.limit;
-      const effectiveCount = !isNaN(parsedCount)
-        ? parsedCount
-        : currentUsage.count;
-      const derivedRemaining = !isNaN(parsedRemaining)
-        ? parsedRemaining
-        : Math.max(0, effectiveLimit - effectiveCount);
-
-      const newUsage = {
-        limit: effectiveLimit,
-        remaining: derivedRemaining,
-        reset: !isNaN(parsedReset) ? parsedReset : currentUsage.reset,
-        count: effectiveCount,
-      };
-
-      await secureStorageService.save(rateLimitKey, newUsage);
-
-      try {
-        await chrome.runtime.sendMessage({
-          action: "rateLimitUpdate",
-          usage: newUsage,
-        });
-      } catch (_) {}
-    }
+    await updateRateLimitFromResponse(response);
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
@@ -594,7 +540,11 @@ async function handleByokRequest({ prompt }, sendResponse) {
   } catch (error) {
     sendResponse({
       success: false,
-      error: typeof error === "object" && error && error.message ? error.message : String(error),
+      error: {
+        message: error.message || String(error),
+        status: error.status,
+        data: error.data,
+      },
     });
   }
 }
