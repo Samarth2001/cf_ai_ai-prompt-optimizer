@@ -22,6 +22,7 @@ const DEFAULTS = {
     "chatgpt.com",
     "gemini.google.com",
     "grok.com",
+    "perplexity.ai",
   ],
   RATE_LIMIT_PER_DAY: 100,
 };
@@ -69,9 +70,12 @@ function isTrustedSender(sender) {
   }
 }
 
+const API_BASE =
+  "https://prompt-enhancer-worker.prompt-enhance-api.workers.dev";
+
 const APP_HTTP_REFERER =
   (chrome.runtime.getManifest && chrome.runtime.getManifest().homepage_url) ||
-  "https://prompt-enhancer-worker.prompt-enhance-api.workers.dev";
+  API_BASE;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -126,7 +130,7 @@ async function ensureValidJwt() {
   }
 
   const redirectUrl = await chrome.identity.getRedirectURL();
-  const authUrl = `https://prompt-enhancer-worker.prompt-enhance-api.workers.dev/turnstile?redirect_uri=${encodeURIComponent(
+  const authUrl = `${API_BASE}/turnstile?redirect_uri=${encodeURIComponent(
     redirectUrl
   )}`;
   const resultUrl = await new Promise((resolve, reject) => {
@@ -148,7 +152,7 @@ async function ensureValidJwt() {
     throw new Error("Turnstile verification failed: no token");
 
   const apiUrl =
-    "https://prompt-enhancer-worker.prompt-enhance-api.workers.dev/api/token";
+    `${API_BASE}/api/token`;
   const response = await fetch(apiUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -231,7 +235,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         try {
           const jwt = await getOrCreateJwt();
           const res = await fetchWithRetry(
-            "https://prompt-enhancer-worker.prompt-enhance-api.workers.dev/api/ratelimit",
+            `${API_BASE}/api/ratelimit`,
             { headers: { Authorization: `Bearer ${jwt}` } },
             2,
             8000,
@@ -329,7 +333,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 async function updateRemoteConfig() {
   try {
     const configUrl =
-      "https://prompt-enhancer-worker.prompt-enhance-api.workers.dev/api/config";
+      `${API_BASE}/api/config`;
     const response = await fetch(configUrl);
     if (!response.ok) {
       throw new Error(`Failed to fetch remote config: ${response.status}`);
@@ -421,7 +425,7 @@ async function handleProxyRequest({ prompt }, sendResponse) {
     }
     const sanitizedPrompt = basePrompt;
     const apiUrl =
-      "https://prompt-enhancer-worker.prompt-enhance-api.workers.dev/api/enhance";
+      `${API_BASE}/api/enhance`;
 
     const response = await fetchWithRetry(
       apiUrl,
@@ -494,7 +498,7 @@ async function handleByokRequest({ prompt }, sendResponse) {
 
     const jwt = await getOrCreateJwt();
     const apiUrl =
-      "https://prompt-enhancer-worker.prompt-enhance-api.workers.dev/api/enhance/byok";
+      `${API_BASE}/api/enhance/byok`;
 
     const response = await fetchWithRetry(
       apiUrl,
